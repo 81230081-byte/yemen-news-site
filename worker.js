@@ -1,30 +1,32 @@
 
-const CACHE_KEY = "yemen-news-cache-v2";
-const CACHE_TTL = 600;
+const CACHE_KEY = "latest-yemen-news";
+const FRESH_SECONDS = 600;
 
-const QUERIES = [
-  '(Yemen OR Yemeni OR اليمن OR اليمنية)',
-  '(Taiz OR تعز OR تعزّ) Yemen'
-];
-
-function cleanText(value) {
+function fixText(value) {
   if (typeof value !== "string") return "";
+
+  // إصلاح بعض حالات تشوّه العربية الناتجة عن قراءة UTF-8 بترميز خاطئ.
+  if (/[ØÙ]/.test(value) && [...value].every(c => c.codePointAt(0) <= 255)) {
+    try {
+      const bytes = Uint8Array.from(
+        [...value].map(c => c.codePointAt(0))
+      );
+      const repaired = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      if (/[\u0600-\u06FF]/.test(repaired)) return repaired;
+    } catch {}
+  }
+
   return value.normalize("NFC").trim();
 }
 
-function relevant(article) {
-  const text = [
-    article.title || "",
-    article.domain || "",
-    article.url || ""
-  ].join(" ").toLowerCase();
-
-  return /yemen|yemeni|اليمن|تعز|taiz|ta'izz|taizz/.test(text);
+function isRelevant(a) {
+  const text = `${a.title || ""} ${a.url || ""} ${a.domain || ""}`;
+  return /yemen|yemeni|اليمن|تعز|taiz|taizz|ta'izz/i.test(text);
 }
 
-async function fetchQuery(query) {
+async function fetchNews() {
   const params = new URLSearchParams({
-    query,
+    query: "Yemen OR Yemeni OR اليمن OR تعز OR Taiz",
     mode: "artlist",
     format: "json",
     maxrecords: "50",
@@ -34,7 +36,7 @@ async function fetchQuery(query) {
 
   const response = await fetch(
     "https://api.gdeltproject.org/api/v2/doc/doc?" + params,
-    { headers: { "Accept": "application/json" } }
+    { headers: { Accept: "application/json" } }
   );
 
   if (!response.ok) {
@@ -47,19 +49,10 @@ async function fetchQuery(query) {
     throw new Error("GDELT response has no articles array");
   }
 
-  return data.articles;
-}
-
-async function fetchNews() {
-  // طلب واحد لتقليل احتمال الوصول إلى حد الطلبات.
-  const raw = await fetchQuery(
-    '(Yemen OR Yemeni OR اليمن OR تعز OR Taiz)'
-  );
-
   const seen = new Set();
 
-  return raw
-    .filter(relevant)
+  return data.articles
+    .filter(isRelevant)
     .map(a => {
       let domain = a.domain || "";
 
@@ -77,7 +70,7 @@ async function fetchNews() {
       }
 
       return {
-        title: cleanText(a.title) || "بدون عنوان",
+        title: fixText(a.title) || "بدون عنوان",
         url: a.url || "",
         date,
         source: domain,
@@ -94,50 +87,66 @@ async function fetchNews() {
 }
 
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request, env) {
     const url = new URL(request.url);
 
     if (url.pathname === "/api/news" && request.method === "GET") {
-      const cache = await caches.open(CACHE_KEY);
-      const key = new Request(url.origin + "/api/news?cached=1");
-      const cached = await cache.match(key);
+      let saved = null;
 
-      if (cached) {
-        const timestamp = Number(cached.headers.get("X-Cached-At"));
-        if (Date.now() - timestamp < CACHE_TTL * 1000) {
-          return new Response(cached.body, {
-            status: 200,
-            headers: {
-              "Content-Type": "application/json; charset=utf-8",
-              "Cache-Control": "public, max-age=60",
-              "X-News-Cache": "fresh"
-            }
-          });
-        }
+      try {
+        saved = await env.NEWS_CACHE.get(CACHE_KEY, "json");
+      } catch (error) {
+        return Response.json({
+          articles: [],
+          warning: "تعذر الوصول إلى مخزن الأخبار.",
+          diagnostic: String(error.message || error)
+        }, {
+          status: 500,
+          headers: { "Content-Type": "application/json; charset=utf-8" }
+        });
+      }
+
+      if (
+        saved &&
+        Array.isArray(saved.articles) &&
+        saved.updatedAt &&
+        Date.now() - Date.parse(saved.updatedAt) < FRESH_SECONDS * 1000
+      ) {
+        return Response.json(saved, {
+          headers: {
+            "Content-Type": "application/json; charset=utf-8",
+            "X-News-Cache": "fresh"
+          }
+        });
       }
 
       try {
         const articles = await fetchNews();
 
-        const result = Response.json({
+        const result = {
           articles,
           updatedAt: new Date().toISOString(),
-          warning: articles.length
-            ? ""
-            : "لم يُعثر على أخبار مطابقة خلال الفترة المحددة."
-        }, {
+          warning: ""
+        };
+
+        await env.NEWS_CACHE.put(
+          CACHE_KEY,
+          JSON.stringify(result),
+          { expirationTtl: 259200 }
+        );
+
+        return Response.json(result, {
           headers: {
             "Content-Type": "application/json; charset=utf-8",
-            "X-Cached-At": String(Date.now())
+            "X-News-Cache": "updated"
           }
         });
-
-        ctx.waitUntil(cache.put(key, result.clone()));
-        return result;
       } catch (error) {
-        if (cached) {
-          return new Response(cached.body, {
-            status: 200,
+        if (saved && Array.isArray(saved.articles)) {
+          return Response.json({
+            ...saved,
+            warning: "تعذر تحديث الأخبار؛ نعرض آخر نسخة محفوظة."
+          }, {
             headers: {
               "Content-Type": "application/json; charset=utf-8",
               "X-News-Cache": "stale"
