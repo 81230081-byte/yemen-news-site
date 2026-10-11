@@ -1,34 +1,10 @@
 
-const QUERIES = [
-  "(Yemen OR اليمن)",
-  "(Taiz OR تعز) Yemen"
-];
-
-function clean(value = "") {
-  return String(value)
-    .replace(/<[^>]*>/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function domainOf(url) {
-  try {
-    return new URL(url).hostname.replace(/^www\./, "");
-  } catch {
-    return "";
-  }
-}
-
-async function fetchQuery(query) {
+async function fetchNews() {
   const params = new URLSearchParams({
-    query,
-    mode: "ArtList",
+    query: "Yemen",
+    mode: "artlist",
     format: "json",
     maxrecords: "50",
-    sort: "DateDesc",
     timespan: "3d"
   });
 
@@ -36,60 +12,50 @@ async function fetchQuery(query) {
     "https://api.gdeltproject.org/api/v2/doc/doc?" + params
   );
 
+  const body = await response.text();
+
   if (!response.ok) {
-    throw new Error("News source returned " + response.status);
+    throw new Error("GDELT HTTP " + response.status);
   }
 
-  const data = await response.json();
-  return Array.isArray(data.articles) ? data.articles : [];
-}
+  let data;
+  try {
+    data = JSON.parse(body);
+  } catch {
+    throw new Error("GDELT returned non-JSON: " + body.slice(0, 180));
+  }
 
-async function getNews() {
-  const batches = await Promise.allSettled(
-    QUERIES.map(fetchQuery)
-  );
+  if (!Array.isArray(data.articles)) {
+    throw new Error("GDELT response has no articles array");
+  }
 
-  const unique = new Map();
+  return data.articles.map(article => {
+    const rawDate = article.seendate || "";
+    let date = null;
 
-  for (const batch of batches) {
-    if (batch.status !== "fulfilled") continue;
+    const match = rawDate.match(
+      /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/
+    );
 
-    for (const article of batch.value) {
-      const url = article.url || article.url_mobile;
-      const title = clean(article.title || "");
-
-      if (!url || !title || !/^https?:\/\//i.test(url)) continue;
-
-      const key = url.split("#")[0].split("?")[0];
-
-      if (!unique.has(key)) {
-        unique.set(key, {
-          title,
-          url,
-          date: article.seendate
-            ? new Date(article.seendate).toISOString()
-            : null,
-          source: clean(article.source || domainOf(url)),
-          domain: domainOf(url),
-          summary: clean(
-            article.snippet || article.description || ""
-          ).slice(0, 260)
-        });
-      }
+    if (match) {
+      date = `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}Z`;
     }
-  }
 
-  const articles = [...unique.values()]
-    .sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0))
-    .slice(0, 70);
+    let domain = article.domain || "";
+    try {
+      domain = new URL(article.url).hostname.replace(/^www\./, "");
+    } catch {}
 
-  return {
-    articles,
-    updatedAt: new Date().toISOString(),
-    warning: batches.every(x => x.status === "rejected")
-      ? "لم تستجب خدمة الأخبار الخارجية."
-      : ""
-  };
+    return {
+      title: article.title || "بدون عنوان",
+      url: article.url || "",
+      date,
+      source: domain,
+      domain,
+      summary: "",
+      language: article.language || ""
+    };
+  }).filter(article => article.url && article.title);
 }
 
 export default {
@@ -98,24 +64,28 @@ export default {
 
     if (url.pathname === "/api/news" && request.method === "GET") {
       try {
-        const data = await getNews();
+        const articles = await fetchNews();
 
-        return Response.json(data, {
+        return Response.json({
+          articles,
+          updatedAt: new Date().toISOString(),
+          warning: articles.length
+            ? ""
+            : "لم يعثر المصدر على أخبار خلال الفترة المحددة."
+        }, {
           headers: {
-            "Cache-Control": "public, max-age=180",
-            "Access-Control-Allow-Origin": "*"
+            "Cache-Control": "public, max-age=180"
           }
         });
-      } catch {
-        return Response.json(
-          {
-            articles: [],
-            warning: "تعذر جلب الأخبار من المصدر الخارجي مؤقتًا."
-          },
-          {
-            headers: { "Cache-Control": "no-store" }
-          }
-        );
+      } catch (error) {
+        return Response.json({
+          articles: [],
+          warning: "تعذر جلب الأخبار الخارجية.",
+          diagnostic: String(error.message || error)
+        }, {
+          status: 502,
+          headers: { "Cache-Control": "no-store" }
+        });
       }
     }
 
